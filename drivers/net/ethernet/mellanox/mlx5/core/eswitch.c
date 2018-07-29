@@ -2216,6 +2216,6 @@ free_out:
 
 u8 mlx5_eswitch_mode(struct mlx5_eswitch *esw)
 {
-	return ESW_ALLOWED(esw) ? esw->mode : SRIOV_NONE;
+	return esw->mode;
 }
 EXPORT_SYMBOL_GPL(mlx5_eswitch_mode);

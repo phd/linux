@@ -402,10 +402,9 @@ static int icmp6_iif(const struct sk_buff *skb)
 
 	/* for local traffic to local address, skb dev is the loopback
 	 * device. Check if there is a dst attached to the skb and if so
-	 * get the real device index. Same is needed for replies to a link
-	 * local address on a device enslaved to an L3 master device
+	 * get the real device index.
 	 */
-	if (unlikely(iif == LOOPBACK_IFINDEX || netif_is_l3_master(skb->dev))) {
+	if (unlikely(iif == LOOPBACK_IFINDEX)) {
 		const struct rt6_info *rt6 = skb_rt6_info(skb);
 
 		if (rt6)

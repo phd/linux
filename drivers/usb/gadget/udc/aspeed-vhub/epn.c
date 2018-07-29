@@ -66,16 +66,11 @@ static void ast_vhub_epn_kick(struct ast_vhub_ep *ep, struct ast_vhub_req *req)
 	if (!req->req.dma) {
 
 		/* For IN transfers, copy data over first */
-		if (ep->epn.is_in) {
-			memcpy(ep->buf, req->req.buf + act, chunk);
-			vhub_dma_workaround(ep->buf);
-		}
-		writel(ep->buf_dma, ep->epn.regs + AST_VHUB_EP_DESC_BASE);
-	} else {
 		if (ep->epn.is_in)
-			vhub_dma_workaround(req->req.buf);
+			memcpy(ep->buf, req->req.buf + act, chunk);
+		writel(ep->buf_dma, ep->epn.regs + AST_VHUB_EP_DESC_BASE);
+	} else
 		writel(req->req.dma + act, ep->epn.regs + AST_VHUB_EP_DESC_BASE);
-	}
 
 	/* Start DMA */
 	req->active = true;
@@ -166,7 +161,6 @@ static inline unsigned int ast_vhub_count_free_descs(struct ast_vhub_ep *ep)
 static void ast_vhub_epn_kick_desc(struct ast_vhub_ep *ep,
 				   struct ast_vhub_req *req)
 {
-	struct ast_vhub_desc *desc = NULL;
 	unsigned int act = req->act_count;
 	unsigned int len = req->req.length;
 	unsigned int chunk;
@@ -183,6 +177,7 @@ static void ast_vhub_epn_kick_desc(struct ast_vhub_ep *ep,
 
 	/* While we can create descriptors */
 	while (ast_vhub_count_free_descs(ep) && req->last_desc < 0) {
+		struct ast_vhub_desc *desc;
 		unsigned int d_num;
 
 		/* Grab next free descriptor */
@@ -231,9 +226,6 @@ static void ast_vhub_epn_kick_desc(struct ast_vhub_ep *ep,
 		/* Account packet */
 		req->act_count = act = act + chunk;
 	}
-
-	if (likely(desc))
-		vhub_dma_workaround(desc);
 
 	/* Tell HW about new descriptors */
 	writel(VHUB_EP_DMA_SET_CPU_WPTR(ep->epn.d_next),

@@ -731,8 +731,7 @@ xfs_inode_validate_extsize(
 	if ((hint_flag || inherit_flag) && extsize == 0)
 		return __this_address;
 
-	/* free inodes get flags set to zero but extsize remains */
-	if (mode && !(hint_flag || inherit_flag) && extsize != 0)
+	if (!(hint_flag || inherit_flag) && extsize != 0)
 		return __this_address;
 
 	if (extsize_bytes % blocksize_bytes)
@@ -778,8 +777,7 @@ xfs_inode_validate_cowextsize(
 	if (hint_flag && cowextsize == 0)
 		return __this_address;
 
-	/* free inodes get flags set to zero but cowextsize remains */
-	if (mode && !hint_flag && cowextsize != 0)
+	if (!hint_flag && cowextsize != 0)
 		return __this_address;
 
 	if (hint_flag && rt_flag)

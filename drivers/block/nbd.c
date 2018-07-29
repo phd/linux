@@ -112,16 +112,12 @@ struct nbd_device {
 	struct task_struct *task_setup;
 };
 
-#define NBD_CMD_REQUEUED	1
-
 struct nbd_cmd {
 	struct nbd_device *nbd;
-	struct mutex lock;
 	int index;
 	int cookie;
+	struct completion send_complete;
 	blk_status_t status;
-	unsigned long flags;
-	u32 cmd_cookie;
 };
 
 #if IS_ENABLED(CONFIG_DEBUG_FS)
@@ -148,35 +144,6 @@ static void nbd_disconnect_and_put(struct nbd_device *nbd);
 static inline struct device *nbd_to_dev(struct nbd_device *nbd)
 {
 	return disk_to_dev(nbd->disk);
-}
-
-static void nbd_requeue_cmd(struct nbd_cmd *cmd)
-{
-	struct request *req = blk_mq_rq_from_pdu(cmd);
-
-	if (!test_and_set_bit(NBD_CMD_REQUEUED, &cmd->flags))
-		blk_mq_requeue_request(req, true);
-}
-
-#define NBD_COOKIE_BITS 32
-
-static u64 nbd_cmd_handle(struct nbd_cmd *cmd)
-{
-	struct request *req = blk_mq_rq_from_pdu(cmd);
-	u32 tag = blk_mq_unique_tag(req);
-	u64 cookie = cmd->cmd_cookie;
-
-	return (cookie << NBD_COOKIE_BITS) | tag;
-}
-
-static u32 nbd_handle_to_tag(u64 handle)
-{
-	return (u32)handle;
-}
-
-static u32 nbd_handle_to_cookie(u64 handle)
-{
-	return (u32)(handle >> NBD_COOKIE_BITS);
 }
 
 static const char *nbdcmd_to_ascii(int cmd)
@@ -352,9 +319,6 @@ static enum blk_eh_timer_return nbd_xmit_timeout(struct request *req,
 	}
 	config = nbd->config;
 
-	if (!mutex_trylock(&cmd->lock))
-		return BLK_EH_RESET_TIMER;
-
 	if (config->num_connections > 1) {
 		dev_err_ratelimited(nbd_to_dev(nbd),
 				    "Connection timed out, retrying (%d/%d alive)\n",
@@ -379,8 +343,7 @@ static enum blk_eh_timer_return nbd_xmit_timeout(struct request *req,
 					nbd_mark_nsock_dead(nbd, nsock, 1);
 				mutex_unlock(&nsock->tx_lock);
 			}
-			mutex_unlock(&cmd->lock);
-			nbd_requeue_cmd(cmd);
+			blk_mq_requeue_request(req, true);
 			nbd_config_put(nbd);
 			return BLK_EH_DONE;
 		}
@@ -390,7 +353,6 @@ static enum blk_eh_timer_return nbd_xmit_timeout(struct request *req,
 	}
 	set_bit(NBD_TIMEDOUT, &config->runtime_flags);
 	cmd->status = BLK_STS_IOERR;
-	mutex_unlock(&cmd->lock);
 	sock_shutdown(nbd);
 	nbd_config_put(nbd);
 done:
@@ -468,9 +430,9 @@ static int nbd_send_cmd(struct nbd_device *nbd, struct nbd_cmd *cmd, int index)
 	struct iov_iter from;
 	unsigned long size = blk_rq_bytes(req);
 	struct bio *bio;
-	u64 handle;
 	u32 type;
 	u32 nbd_cmd_flags = 0;
+	u32 tag = blk_mq_unique_tag(req);
 	int sent = nsock->sent, skip = 0;
 
 	iov_iter_kvec(&from, WRITE | ITER_KVEC, &iov, 1, sizeof(request));
@@ -512,8 +474,6 @@ static int nbd_send_cmd(struct nbd_device *nbd, struct nbd_cmd *cmd, int index)
 			goto send_pages;
 		}
 		iov_iter_advance(&from, sent);
-	} else {
-		cmd->cmd_cookie++;
 	}
 	cmd->index = index;
 	cmd->cookie = nsock->cookie;
@@ -522,8 +482,7 @@ static int nbd_send_cmd(struct nbd_device *nbd, struct nbd_cmd *cmd, int index)
 		request.from = cpu_to_be64((u64)blk_rq_pos(req) << 9);
 		request.len = htonl(size);
 	}
-	handle = nbd_cmd_handle(cmd);
-	memcpy(request.handle, &handle, sizeof(handle));
+	memcpy(request.handle, &tag, sizeof(tag));
 
 	dev_dbg(nbd_to_dev(nbd), "request %p: sending control (%s@%llu,%uB)\n",
 		req, nbdcmd_to_ascii(type),
@@ -541,7 +500,6 @@ static int nbd_send_cmd(struct nbd_device *nbd, struct nbd_cmd *cmd, int index)
 				nsock->pending = req;
 				nsock->sent = sent;
 			}
-			set_bit(NBD_CMD_REQUEUED, &cmd->flags);
 			return BLK_STS_RESOURCE;
 		}
 		dev_err_ratelimited(disk_to_dev(nbd->disk),
@@ -583,7 +541,6 @@ send_pages:
 					 */
 					nsock->pending = req;
 					nsock->sent = sent;
-					set_bit(NBD_CMD_REQUEUED, &cmd->flags);
 					return BLK_STS_RESOURCE;
 				}
 				dev_err(disk_to_dev(nbd->disk),
@@ -616,12 +573,10 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 	struct nbd_reply reply;
 	struct nbd_cmd *cmd;
 	struct request *req = NULL;
-	u64 handle;
 	u16 hwq;
 	u32 tag;
 	struct kvec iov = {.iov_base = &reply, .iov_len = sizeof(reply)};
 	struct iov_iter to;
-	int ret = 0;
 
 	reply.magic = 0;
 	iov_iter_kvec(&to, READ | ITER_KVEC, &iov, 1, sizeof(reply));
@@ -639,8 +594,8 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 		return ERR_PTR(-EPROTO);
 	}
 
-	memcpy(&handle, reply.handle, sizeof(handle));
-	tag = nbd_handle_to_tag(handle);
+	memcpy(&tag, reply.handle, sizeof(u32));
+
 	hwq = blk_mq_unique_tag_to_hwq(tag);
 	if (hwq < nbd->tag_set.nr_hw_queues)
 		req = blk_mq_tag_to_rq(nbd->tag_set.tags[hwq],
@@ -651,25 +606,11 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 		return ERR_PTR(-ENOENT);
 	}
 	cmd = blk_mq_rq_to_pdu(req);
-
-	mutex_lock(&cmd->lock);
-	if (cmd->cmd_cookie != nbd_handle_to_cookie(handle)) {
-		dev_err(disk_to_dev(nbd->disk), "Double reply on req %p, cmd_cookie %u, handle cookie %u\n",
-			req, cmd->cmd_cookie, nbd_handle_to_cookie(handle));
-		ret = -ENOENT;
-		goto out;
-	}
-	if (test_bit(NBD_CMD_REQUEUED, &cmd->flags)) {
-		dev_err(disk_to_dev(nbd->disk), "Raced with timeout on req %p\n",
-			req);
-		ret = -ENOENT;
-		goto out;
-	}
 	if (ntohl(reply.error)) {
 		dev_err(disk_to_dev(nbd->disk), "Other side returned error (%d)\n",
 			ntohl(reply.error));
 		cmd->status = BLK_STS_IOERR;
-		goto out;
+		return cmd;
 	}
 
 	dev_dbg(nbd_to_dev(nbd), "request %p: got reply\n", req);
@@ -694,18 +635,18 @@ static struct nbd_cmd *nbd_read_stat(struct nbd_device *nbd, int index)
 				if (nbd_disconnected(config) ||
 				    config->num_connections <= 1) {
 					cmd->status = BLK_STS_IOERR;
-					goto out;
+					return cmd;
 				}
-				ret = -EIO;
-				goto out;
+				return ERR_PTR(-EIO);
 			}
 			dev_dbg(nbd_to_dev(nbd), "request %p: got %d bytes data\n",
 				req, bvec.bv_len);
 		}
+	} else {
+		/* See the comment in nbd_queue_rq. */
+		wait_for_completion(&cmd->send_complete);
 	}
-out:
-	mutex_unlock(&cmd->lock);
-	return ret ? ERR_PTR(ret) : cmd;
+	return cmd;
 }
 
 static void recv_work(struct work_struct *work)
@@ -864,7 +805,7 @@ again:
 	 */
 	blk_mq_start_request(req);
 	if (unlikely(nsock->pending && nsock->pending != req)) {
-		nbd_requeue_cmd(cmd);
+		blk_mq_requeue_request(req, true);
 		ret = 0;
 		goto out;
 	}
@@ -877,7 +818,7 @@ again:
 		dev_err_ratelimited(disk_to_dev(nbd->disk),
 				    "Request send failed, requeueing\n");
 		nbd_mark_nsock_dead(nbd, nsock, 1);
-		nbd_requeue_cmd(cmd);
+		blk_mq_requeue_request(req, true);
 		ret = 0;
 	}
 out:
@@ -901,8 +842,7 @@ static blk_status_t nbd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 * that the server is misbehaving (or there was an error) before we're
 	 * done sending everything over the wire.
 	 */
-	mutex_lock(&cmd->lock);
-	clear_bit(NBD_CMD_REQUEUED, &cmd->flags);
+	init_completion(&cmd->send_complete);
 
 	/* We can be called directly from the user space process, which means we
 	 * could possibly have signals pending so our sendmsg will fail.  In
@@ -914,7 +854,7 @@ static blk_status_t nbd_queue_rq(struct blk_mq_hw_ctx *hctx,
 		ret = BLK_STS_IOERR;
 	else if (!ret)
 		ret = BLK_STS_OK;
-	mutex_unlock(&cmd->lock);
+	complete(&cmd->send_complete);
 
 	return ret;
 }
@@ -1520,8 +1460,6 @@ static int nbd_init_request(struct blk_mq_tag_set *set, struct request *rq,
 {
 	struct nbd_cmd *cmd = blk_mq_rq_to_pdu(rq);
 	cmd->nbd = set->driver_data;
-	cmd->flags = 0;
-	mutex_init(&cmd->lock);
 	return 0;
 }
 
